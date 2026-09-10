@@ -22,14 +22,14 @@ def trading_days(start="2026-01-05", end="2026-02-13"):
     return [d.strftime("%Y-%m-%d") for d in days]
 
 
-def base_chain() -> pd.DataFrame:
+def base_chain(expiration: str = EXPIRATION) -> pd.DataFrame:
     rows = []
     for strike in range(80, 121):
         k = float(strike)
         call_delta = max(0.01, min(0.99, 0.5 + (100.0 - k) * 0.04))
         for opt_type, delta in (("call", call_delta), ("put", call_delta - 1.0)):
             mid = max(0.10, 2.0 * min(call_delta, 1 - call_delta) + 1.0)
-            rows.append({"expiration": EXPIRATION, "type": opt_type,
+            rows.append({"expiration": expiration, "type": opt_type,
                          "strike": k, "bid": mid - 0.05, "ask": mid + 0.05,
                          "iv": 0.25, "delta": round(delta, 4)})
     return pd.DataFrame(rows)
@@ -44,9 +44,11 @@ class FakeHistory:
     decayed toward profit. Days without a factor return an empty frame
     (dataset gap)."""
 
-    def __init__(self, value_factors: dict[str, float]):
+    def __init__(self, value_factors: dict[str, float],
+                 expirations: list[str] | None = None):
         self.factors = value_factors
-        self._chain = base_chain()
+        exps = expirations or [EXPIRATION]
+        self._chain = pd.concat([base_chain(e) for e in exps], ignore_index=True)
 
     def day_chains(self, symbol, day, max_dte=50):
         factor = self.factors.get(day)
@@ -221,3 +223,67 @@ class TestSummary:
         assert s["win_rate"] == 1.0
         assert s["exit_reasons"] == {"profit_target": 1}
         assert result.summary(variant="nope") == {"trades": 0}
+
+class TestPerVariantDteWindow:
+    """Issue #20: mixed DTE windows must not share variants[0]'s expiration."""
+
+    def test_mixed_windows_pick_own_expiration(self):
+        weekly_exp = "2026-01-12"  # 7 DTE from ENTRY
+        history = FakeHistory(
+            {d: (1.0 if d == ENTRY else 0.01) for d in trading_days()},
+            expirations=[weekly_exp, EXPIRATION],
+        )
+        weekly = CreditVariantConfig(
+            name="weekly", short_put_delta=0.10, min_credit_frac=0.0,
+            min_dte=5, max_dte=14, target_dte=7,
+        )
+        monthly = CreditVariantConfig(
+            name="monthly", short_put_delta=0.10, min_credit_frac=0.0,
+            min_dte=25, max_dte=50, target_dte=45,
+        )
+        engine = ManagedBacktestEngine(history, spot_lookup())
+        result = engine.run([SYMBOL], ENTRY, ENTRY, [weekly, monthly])
+        by_name = {t.variant: t for t in result.trades}
+        assert by_name["weekly"].expiration == weekly_exp
+        assert by_name["weekly"].dte_at_entry == 7
+        assert by_name["monthly"].expiration == EXPIRATION
+        assert by_name["monthly"].dte_at_entry == 39
+
+    def test_zero_dte_first_does_not_starve_monthly(self):
+        # Reproduction from the issue: condor_0dte (0-1) listed first,
+        # put_spread_15 (25-50) second. Old code built both on 0 DTE.
+        history = FakeHistory(
+            {d: (1.0 if d == ENTRY else 0.01) for d in trading_days()},
+            expirations=[ENTRY, EXPIRATION],
+        )
+        zero = CreditVariantConfig(
+            name="condor_0dte", short_put_delta=0.15, short_call_delta=0.15,
+            min_credit_frac=0.0, min_dte=0, max_dte=1, target_dte=0,
+            wing_width_frac=0.01,
+        )
+        monthly = CreditVariantConfig(
+            name="put_spread_15", short_put_delta=0.15, min_credit_frac=0.0,
+        )
+        engine = ManagedBacktestEngine(history, spot_lookup())
+        result = engine.run([SYMBOL], ENTRY, ENTRY, [zero, monthly])
+        by_name = {t.variant: t for t in result.trades}
+        assert by_name["condor_0dte"].expiration == ENTRY
+        assert by_name["put_spread_15"].expiration == EXPIRATION
+
+    def test_missing_window_skips_only_that_variant(self):
+        # Chain has only the 39-DTE expiry. Weekly must skip, not enter
+        # on the monthly expiration.
+        history = FakeHistory(
+            {d: (1.0 if d == ENTRY else 0.01) for d in trading_days()},
+        )
+        weekly = CreditVariantConfig(
+            name="weekly", short_put_delta=0.10, min_credit_frac=0.0,
+            min_dte=5, max_dte=14, target_dte=7,
+        )
+        monthly = CreditVariantConfig(
+            name="monthly", short_put_delta=0.10, min_credit_frac=0.0,
+        )
+        engine = ManagedBacktestEngine(history, spot_lookup())
+        result = engine.run([SYMBOL], ENTRY, ENTRY, [weekly, monthly])
+        assert {t.variant for t in result.trades} == {"monthly"}
+        assert result.skipped_no_expiration == 1
