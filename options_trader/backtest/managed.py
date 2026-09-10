@@ -172,7 +172,8 @@ class ManagedBacktestEngine:
                 continue
             if day > end and not book:
                 break
-            chains = self.history.day_chains(symbol, day, self.MAX_DTE_FETCH)
+            fetch_dte = max([self.MAX_DTE_FETCH, *(v.max_dte for v in variants)])
+            chains = self.history.day_chains(symbol, day, fetch_dte)
             spot = self.spots.get((symbol, day))
             if chains.empty:
                 result.skipped_no_data += 1
@@ -201,20 +202,28 @@ class ManagedBacktestEngine:
             if trade is not None:
                 result.trades.append(trade)
 
+    def _expiration_for(self, day: str, chains: pd.DataFrame,
+                        cfg: CreditVariantConfig) -> str | None:
+        """Expiration in this variant's DTE window, closest to target_dte."""
+        exps = sorted({str(e)[:10] for e in chains["expiration"]})
+        in_window = [e for e in exps
+                     if cfg.min_dte <= _dte(day, e) <= cfg.max_dte]
+        if not in_window:
+            return None
+        return min(in_window, key=lambda e: abs(_dte(day, e) - cfg.target_dte))
+
     def _enter(self, symbol: str, day: str, spot: float, chains: pd.DataFrame,
                variants: list[CreditVariantConfig],
                result: ManagedBacktestResult):
-        v0 = variants[0]   # shipped variants share the DTE window
-        exps = sorted({str(e)[:10] for e in chains["expiration"]})
-        exps = [e for e in exps if v0.min_dte <= _dte(day, e) <= v0.max_dte]
-        if not exps:
-            result.skipped_no_expiration += 1
-            return []
-        expiration = min(exps, key=lambda e: abs(_dte(day, e) - v0.target_dte))
-        chain = chains[chains["expiration"].astype(str).str[:10] == expiration]
-
+        # Pick expiration per variant so mixed DTE windows cannot silently
+        # reuse variants[0]'s window (issue #20).
         entered = []
         for cfg in variants:
+            expiration = self._expiration_for(day, chains, cfg)
+            if expiration is None:
+                result.skipped_no_expiration += 1
+                continue
+            chain = chains[chains["expiration"].astype(str).str[:10] == expiration]
             pos = build_position(chain, spot, symbol, day, expiration,
                                  _dte(day, expiration), cfg, self.slip_frac)
             if pos is None:
