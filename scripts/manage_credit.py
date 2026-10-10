@@ -25,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from options_trader.risk.exit_policy import stop_hit
 from options_trader.config import StrategyConfig
 from options_trader.execution.paper import PaperBroker
 from options_trader.journal import Journal
@@ -57,14 +58,23 @@ def variant_config(kind: str) -> CreditVariantConfig:
 
 def manage_position(rec, cfg: StrategyConfig, journal: Journal,
                     broker: PaperBroker, provider, settlement_provider,
-                    today: date) -> str:
+                    today: date,
+                    vcfg: CreditVariantConfig | None = None) -> str:
     """Apply the profit-target / time-exit / settlement rules to one open
     position and return the line describing what happened. Raises on any
     provider/data failure — the caller decides whether that should abort
-    the whole batch or just skip this position and retry it next run."""
+    the whole batch or just skip this position and retry it next run.
+
+    `vcfg` overrides the VALIDATED lookup. Callers that manage variants
+    from another registry (scripts/manage_income.py) must pass it: without
+    it a variant absent from VALIDATED silently falls back to
+    CreditVariantConfig's defaults. A short-DTE variant that sets its own
+    tighter exit — spec_weekly_put_25d's time_exit_dte=1, say — then gets
+    the default's min(21, half the entry DTE) instead and closes early.
+    """
     import json as _json
 
-    vcfg = variant_config(rec.kind)
+    vcfg = vcfg or variant_config(rec.kind)
     entry = journal.candidate(rec.id) or {}
     dte_at_entry = int(entry.get("dte_at_entry", 45))
     dte = (date.fromisoformat(rec.expiration) - today).days
@@ -81,6 +91,9 @@ def manage_position(rec, cfg: StrategyConfig, journal: Journal,
     snap = provider.get_chain(rec.underlying, rec.expiration)
     marks = mark_position(legs, snap.chain)
     if marks is None:
+        if dte <= vcfg.time_exit_threshold(dte_at_entry):
+            return (f"{tag}: TIME EXIT DUE but unmarkable today (missing/"
+                    f"crossed leg quote) — CLOSE MANUALLY; never hold to expiry")
         return f"{tag}: unmarkable today (missing/crossed leg quote) — no action"
     cost_mid, half_sum = marks
     exit_cost_est = cost_mid + cfg.slippage_half_spread_frac * half_sum
@@ -91,6 +104,20 @@ def manage_position(rec, cfg: StrategyConfig, journal: Journal,
         closed = broker.close_credit(rec.id, cost_mid, half_sum,
                                      notes="profit target (daily check)")
         return (f"{tag}: PROFIT TARGET — captured {captured:.2f} of "
+                f"{rec.entry_debit:.2f}, pnl {closed.realized_pnl:+.2f}")
+    fired, thr, loss_usd = stop_hit(cfg, -captured, rec.contracts,
+                                    rec.max_loss)
+    if fired:
+        closed = broker.close_credit(rec.id, cost_mid, half_sum,
+                                     notes=f"stop loss ({cfg.stop_loss_mode})")
+        return (f"{tag}: STOP LOSS — unrealized loss ${loss_usd:,.2f} >= "
+                f"${thr:,.2f} ({cfg.stop_loss_mode}), "
+                f"pnl {closed.realized_pnl:+.2f}")
+    frac = getattr(vcfg, "stop_loss_frac", None)
+    if thr is None and frac is not None and -captured >= frac * rec.entry_debit:
+        closed = broker.close_credit(rec.id, cost_mid, half_sum,
+                                     notes="stop loss (variant stop_loss_frac)")
+        return (f"{tag}: STOP LOSS — loss {-captured:.2f} >= {frac:g}x credit "
                 f"{rec.entry_debit:.2f}, pnl {closed.realized_pnl:+.2f}")
     if dte <= vcfg.time_exit_threshold(dte_at_entry):
         closed = broker.close_credit(rec.id, cost_mid, half_sum,

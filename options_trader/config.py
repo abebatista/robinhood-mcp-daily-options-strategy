@@ -71,6 +71,19 @@ class StrategyConfig:
     vix_spike_pct: float = 0.30             # refuse if VIX rose this much...
     vix_spike_lookback_days: int = 5        # ...over this many trading days
 
+    # --- Optional structures (paper only) ---
+    # Iron butterfly (signals/butterfly.py). Off by default: when False the
+    # income scan never builds one, including from cron.
+    enable_iron_butterfly: bool = False
+
+    # --- Loss stop (risk/exit_policy.py) ---
+    # None = no loss stop (credit book). The income framework sets
+    # "account_equity" (loss >= max_loss_pct_account x equity) or
+    # "position_max_loss" (loss >= max_loss_pct_position x position max loss).
+    stop_loss_mode: str | None = None
+    max_loss_pct_account: float = 0.05
+    max_loss_pct_position: float = 0.50
+
     # --- Output ---
     top_n: int = 5
 
@@ -89,3 +102,15 @@ class StrategyConfig:
     @property
     def daily_loss_limit(self) -> float:
         return self.account_equity * self.daily_loss_limit_pct
+
+
+def load_income_config(path) -> StrategyConfig:
+    """Load the income config, failing LOUDLY if take_profit_pct is absent:
+    StrategyConfig's own default (0.75) belongs to the debit book and must
+    never silently become the income framework's profit target."""
+    raw = json.loads(Path(path).read_text())   # missing file raises
+    if "take_profit_pct" not in raw:
+        raise ValueError(f"{path}: take_profit_pct is required for the income "
+                         "framework (expected 0.2); refusing to fall back to "
+                         "StrategyConfig's 0.75 default")
+    return StrategyConfig.from_json(path)
